@@ -1034,6 +1034,9 @@
   let activeChatId  = null;
   let chatUnsub     = null;
   let presenceHeartbeat = null;
+  let adminPresenceUnsub = null;
+  let adminTypingUnsub   = null;
+  let agentTypingTimeout = null;
   let deadlineTimer = null;
   let submitFiles   = [];
 
@@ -1173,21 +1176,51 @@
     listenNotifications();
     listenAgentProfileReview();
     startAgentPresence();
+    listenAdminPresence();
   }
 
-  function updateAgentPresence(isOnline) {
+  function updateAgentPresence(isOnline = true) {
     if (!currentUser?.uid) return Promise.resolve();
     return updateDoc(doc(db, 'agents', currentUser.uid), {
-      isOnline,
+      isOnline: Boolean(isOnline),
       lastActive: serverTimestamp()
-    }).catch(e => console.error('Error updating online status:', e));
+    }).catch(e => console.warn('Error updating online status:', e));
   }
 
   function startAgentPresence() {
     if (!currentUser?.uid) return;
     if (presenceHeartbeat) clearInterval(presenceHeartbeat);
-    updateAgentPresence(!document.hidden);
-    presenceHeartbeat = setInterval(() => updateAgentPresence(!document.hidden), 30000);
+    updateAgentPresence(true);
+    presenceHeartbeat = setInterval(() => updateAgentPresence(true), 25000);
+  }
+
+  function listenAdminPresence() {
+    if (adminPresenceUnsub) adminPresenceUnsub();
+    adminPresenceUnsub = onSnapshot(doc(db, 'meta', 'admin_presence'), snap => {
+      const data = snap.data() || {};
+      const lastActive = data.lastActive?.toDate
+        ? data.lastActive.toDate()
+        : data.lastActive?.seconds
+          ? new Date(data.lastActive.seconds * 1000)
+          : data.lastActive ? new Date(data.lastActive) : null;
+      const diffMs = lastActive ? (Date.now() - lastActive.getTime()) : Infinity;
+      const isOnline = Boolean(data.isOnline === true && (!lastActive || diffMs < 120000));
+      const dot = document.getElementById('chat-status-dot');
+      const label = document.getElementById('chat-admin-status');
+      if (dot) {
+        dot.classList.toggle('online', isOnline);
+        dot.classList.toggle('offline', !isOnline);
+      }
+      if (label) {
+        label.textContent = isOnline
+          ? 'Admin is online'
+          : (lastActive && diffMs < 86400000
+              ? 'Admin last active ' + lastActive.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+              : 'Admin is offline');
+      }
+    }, err => {
+      console.warn('Admin presence listener note:', err);
+    });
   }
 
   function listenAgentProfileReview() {
@@ -1213,9 +1246,12 @@
   }
 
   document.addEventListener('visibilitychange', () => {
-    if (currentUser?.uid) updateAgentPresence(!document.hidden);
+    if (currentUser?.uid) updateAgentPresence(true);
   });
   window.addEventListener('pagehide', () => {
+    if (currentUser?.uid) updateAgentPresence(false);
+  });
+  window.addEventListener('beforeunload', () => {
     if (currentUser?.uid) updateAgentPresence(false);
   });
 
@@ -1897,8 +1933,16 @@
     activeChatId = assignId;
     document.getElementById('chat-work-title').textContent = escHtml(a.title||'Work');
     setTypingStatus(false);
+    if (adminTypingUnsub) adminTypingUnsub();
+    adminTypingUnsub = onSnapshot(doc(db, 'agents/' + currentUser.uid + '/chatStatus/admin'), snap => {
+      const d = snap.data() || {};
+      const ind = document.getElementById('admin-typing-indicator');
+      if (ind) ind.style.display = d.isTyping ? 'block' : 'none';
+    }, err => console.warn('Admin typing listener:', err));
     // Unsubscribe previous listener
     if (chatUnsub) chatUnsub();
+    if (adminPresenceUnsub) adminPresenceUnsub();
+    if (adminTypingUnsub) adminTypingUnsub();
     chatUnsub = onSnapshot(
       query(collection(db,`agents/${currentUser.uid}/chat`), orderBy('timestamp','asc')),
       snap => {
@@ -1972,21 +2016,25 @@
   };
 
   window.setTypingStatus = async function(isTyping) {
-    if (!activeChatId) return;
-    const a = assignments.find(x=>x.id===activeChatId);
-    if (!a) return;
+    if (!activeChatId || !currentUser?.uid) return;
     try {
-      const chatStatusRef = doc(db, `agents/${currentUser.uid}/chatStatus/${activeChatId}`);
-      await setDoc(chatStatusRef, {
+      const payload = {
         agentId: currentUser.uid,
         assignId: activeChatId,
-        isTyping: isTyping,
-        lastSeen: serverTimestamp(),
-        isOnline: true
-      });
-      // Also update the agent's lastActive timestamp
+        isTyping: Boolean(isTyping),
+        lastSeen: serverTimestamp()
+      };
+      await setDoc(doc(db, 'agents/' + currentUser.uid + '/chatStatus/' + activeChatId), payload, { merge: true });
+      await setDoc(doc(db, 'agents/' + currentUser.uid + '/chatStatus/agent'), payload, { merge: true });
       await updateDoc(doc(db, 'agents', currentUser.uid), { lastActive: serverTimestamp() });
-    } catch(e) { console.error('Error updating typing status:', e); }
+    } catch(e) { console.warn('Error updating typing status:', e); }
+
+    if (isTyping) {
+      if (agentTypingTimeout) clearTimeout(agentTypingTimeout);
+      agentTypingTimeout = setTimeout(() => {
+        window.setTypingStatus(false);
+      }, 3000);
+    }
   };
 
   // ── ANALYTICS ──
